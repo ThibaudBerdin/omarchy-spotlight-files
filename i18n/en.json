@@ -1,4 +1,5 @@
 {
+  "bar.tooltip": "Spotlight Files (right-click: content search)",
   "search.placeholderName": "Search files and folders… (?query for content)",
   "search.placeholderContent": "Search inside PDFs, Office & text documents…",
   "mode.name": "Names",

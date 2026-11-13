@@ -1,16 +1,25 @@
 {
   "schemaVersion": 1,
-  "id": "thibaud.files",
+  "id": "io.github.thibaudberdin.spotlight-files",
   "name": "Spotlight Files",
-  "version": "0.1.0",
-  "author": "Thibaud",
+  "version": "1.0.0",
+  "author": "Thibaud Berdin",
   "license": "MIT",
-  "description": "Spotlight-style file and document search for Omarchy (filenames via fd/fzf + on-demand PDF/Office content search via SQLite FTS5 & ripgrep, live preview, Dropbox link copy, zero background daemon).",
+  "description": "Spotlight-style file and document search for Omarchy: instant filename fuzzy search (fd + fzf) and on-demand PDF, Office & text content search (SQLite FTS5 + ripgrep) with live preview, Dropbox share-link copy, and zero background daemon.",
   "kinds": [
-    "overlay"
+    "overlay",
+    "bar-widget"
   ],
   "keepLoaded": true,
   "entryPoints": {
-    "overlay": "Files.qml"
+    "overlay": "Files.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Spotlight Files",
+    "description": "Open Spotlight file and document content search (left-click: names, right-click: content).",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right"
   }
 }

@@ -1,4 +1,5 @@
 {
+  "bar.tooltip": "Spotlight Files (clic droit : chercher dans le contenu)",
   "search.placeholderName": "Rechercher un fichier ou dossier… (?mot pour le contenu)",
   "search.placeholderContent": "Rechercher dans le texte des PDF, Word, Excel, notes…",
   "mode.name": "Noms",

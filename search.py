@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Spotlight-style search & preview backend for thibaud.files (Omarchy Quickshell).
+"""Spotlight-style search & preview backend for Spotlight Files (Omarchy Quickshell).
 
 Zero permanent background daemon:
 - Filename search: fd + fzf --scheme=path over cached relative paths (~25-200ms on 220k files).
@@ -29,13 +29,31 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
+PLUGIN_ID = "io.github.thibaudberdin.spotlight-files"
 HOME = Path.home()
-CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "thibaud.files"
-CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "thibaud-files.json"
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / PLUGIN_ID
+CONFIG_PATH = XDG_CONFIG / "omarchy" / "spotlight-files.json"
+LANGUAGE_PATH = XDG_CONFIG / "omarchy" / "language"
 PATHS_CACHE = CACHE_DIR / "paths.txt"
 RECENT_CACHE = CACHE_DIR / "recent.json"
 PREVIEW_DIR = CACHE_DIR / "previews"
 FTS_DB = CACHE_DIR / "fts.sqlite"
+
+
+def is_french() -> bool:
+    try:
+        if LANGUAGE_PATH.is_file():
+            code = LANGUAGE_PATH.read_text(encoding="utf-8").strip().lower()
+            if code:
+                return code.startswith("fr")
+    except OSError:
+        pass
+    lang = (os.environ.get("LC_ALL") or os.environ.get("LANG") or "").lower()
+    return lang.startswith("fr")
+
+
+IS_FR = is_french()
 
 DEFAULT_EXCLUDES = [
     ".git",
@@ -153,24 +171,31 @@ def glyph_for(path: Path, is_dir: bool = False) -> str:
 
 def human_size(num: int) -> str:
     val = float(num)
-    for unit in ("o", "Ko", "Mo", "Go", "To"):
-        if val < 1024.0 or unit == "To":
-            if unit == "o":
+    units = ("o", "Ko", "Mo", "Go", "To") if IS_FR else ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if val < 1024.0 or unit == units[-1]:
+            if unit == units[0]:
                 return f"{int(val)} {unit}"
-            return f"{val:.1f} {unit}".replace(".", ",")
+            formatted = f"{val:.1f} {unit}"
+            return formatted.replace(".", ",") if IS_FR else formatted
         val /= 1024.0
-    return f"{num} o"
+    return f"{num} {units[0]}"
 
 
 def human_date(mtime: float) -> str:
     d = dt.datetime.fromtimestamp(mtime)
     now = dt.datetime.now()
     if d.date() == now.date():
-        return f"Aujourd’hui {d.strftime('%H:%M')}"
+        prefix = "Aujourd’hui" if IS_FR else "Today"
+        return f"{prefix} {d.strftime('%H:%M')}"
     if d.date() == (now.date() - dt.timedelta(days=1)):
-        return f"Hier {d.strftime('%H:%M')}"
-    months = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."]
-    return f"{d.day} {months[d.month - 1]} {d.year}"
+        prefix = "Hier" if IS_FR else "Yesterday"
+        return f"{prefix} {d.strftime('%H:%M')}"
+    if IS_FR:
+        months = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."]
+        return f"{d.day} {months[d.month - 1]} {d.year}"
+    months_en = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    return f"{months_en[d.month - 1]} {d.day}, {d.year}"
 
 
 def rel_display(path: Path) -> str:
@@ -365,7 +390,8 @@ def extract_xlsx(path: Path, max_bytes: int) -> str:
 
         sheets = sorted(n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
         for idx, sname in enumerate(sheets):
-            header = sheet_names[idx] if idx < len(sheet_names) else f"Feuille {idx + 1}"
+            default_sheet = f"Feuille {idx + 1}" if IS_FR else f"Sheet {idx + 1}"
+            header = sheet_names[idx] if idx < len(sheet_names) else default_sheet
             out.append(f"=== {header} ===\n")
             sroot = ET.fromstring(zf.read(sname))
             for row in sroot.iter():
@@ -898,7 +924,8 @@ def build_preview(path_str: str, query: str = "") -> dict:
                 entries.append(f"{glyph_for(child, is_d)}  {child.name}{'/' if is_d else ''}")
         except OSError:
             pass
-        meta = f"Dossier · {human_date(st.st_mtime)}"
+        folder_label = "Dossier" if IS_FR else "Folder"
+        meta = f"{folder_label} · {human_date(st.st_mtime)}"
         return {
             "kind": "folder",
             "imagePath": "",
@@ -1045,7 +1072,7 @@ def run_action(action: str, path_str: str) -> int:
 
     if action == "dropbox-link":
         if not shutil.which("dropbox-cli"):
-            notify("Dropbox CLI introuvable", p.name, "󰇣")
+            notify("Dropbox CLI introuvable" if IS_FR else "Dropbox CLI not found", p.name, "󰇣")
             return 1
         proc = subprocess.run(
             ["dropbox-cli", "sharelink", str(p)],
@@ -1058,21 +1085,22 @@ def run_action(action: str, path_str: str) -> int:
         link = proc.stdout.strip()
         if proc.returncode == 0 and link.startswith("http"):
             subprocess.run(["wl-copy", "--", link], check=False)
-            notify("Lien Dropbox copié", p.name, "󰇣")
+            notify("Lien Dropbox copié" if IS_FR else "Dropbox link copied", p.name, "󰇣")
             return 0
-        err = (proc.stderr or proc.stdout).strip() or "Impossible de générer le lien"
-        notify("Erreur Dropbox", err[:120], "󰇣")
+        fallback_err = "Impossible de générer le lien" if IS_FR else "Unable to generate share link"
+        err = (proc.stderr or proc.stdout).strip() or fallback_err
+        notify("Erreur Dropbox" if IS_FR else "Dropbox error", err[:120], "󰇣")
         return 1
 
     if action == "copy-path":
         subprocess.run(["wl-copy", "--", str(p)], check=False)
-        notify("Chemin copié", str(p), "󰆏")
+        notify("Chemin copié" if IS_FR else "Path copied", str(p), "󰆏")
         return 0
 
     if action == "trash":
         res = subprocess.run(["gio", "trash", "--", str(p)], check=False)
         if res.returncode == 0:
-            notify("Déplacé dans la corbeille", p.name, "󰩺")
+            notify("Déplacé dans la corbeille" if IS_FR else "Moved to trash", p.name, "󰩺")
         return res.returncode
 
     return 1

@@ -95,8 +95,9 @@ Item {
     if (payload.mode === "content" || payload.mode === "name") {
       root.searchMode = payload.mode
     }
-    root.filterText = ""
-    filterInput.text = ""
+    var initialQuery = typeof payload.query === "string" ? payload.query : ""
+    root.filterText = initialQuery
+    filterInput.text = initialQuery
     root.selectedIndex = 0
     root.cursorActive = true
     root.disarmPointer()
@@ -497,7 +498,7 @@ Item {
   OverlayWindow {
     id: panel
     shown: root.opened
-    WlrLayershell.namespace: "thibaud-files"
+    WlrLayershell.namespace: "spotlight-files"
 
     Rectangle {
       anchors.fill: parent

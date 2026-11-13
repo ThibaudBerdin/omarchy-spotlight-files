@@ -1,53 +1,123 @@
-# thibaud.files — Spotlight Files pour Omarchy
+# Spotlight Files for Omarchy
 
-Plugin overlay natif **Quickshell** (`omarchy-shell`) pour chercher instantanément dans ses dossiers et **Dropbox** façon Spotlight sur macOS, **sans démon permanent en arrière-plan** (100 % aligné avec la philosophie Omarchy 4 / `folio`).
+![Spotlight Files preview](preview.png)
 
-## Fonctionnalités
+macOS Spotlight-style file and document content search for **Omarchy** (`omarchy-shell` / Quickshell), engineered for large local trees and synced **Dropbox** folders (200k+ files) with **zero permanent background daemon**.
 
-- **Recherche par nom ultra-rapide (`fd` + `fzf`)** : parcourt ~220 000 fichiers en ~200 ms avec correspondance floue multi-mots (`invoice 2019 pdf`, `berdin devis`).
-- **Recherche dans le contenu (`Tab` ou préfixe `?mot` / `c:mot`)** :
-  - **PDF, Word (`.docx`), Excel (`.xlsx`), PowerPoint (`.pptx`), LibreOffice (`.odt`/`.ods`)** via un cache local **SQLite FTS5** insensible aux accents (`unicode61 remove_diacritics 2`) + extraction à la demande (`pdftotext` / XML).
-  - **Texte, Markdown, CSV, JSON et code** en direct via `ripgrep` (`rg`).
-  - **`Ctrl + I`** dans l'interface lance (ou met en pause) la pré-indexation incrémentale de tous les PDF/Office dans `~/.cache/thibaud.files/fts.sqlite` (seuls les fichiers nouveaux ou modifiés sont lus).
-- **Préfixes rapides dans la barre** :
-  - `?terme` ou `c:terme` : chercher dans le contenu
-  - `d:terme` : dossiers uniquement
-  - `pdf:terme`, `doc:terme`, `xls:terme`, `img:terme` : filtrer par type
-- **Aperçu Spotlight en direct** : rendu de la 1re page des PDF (`pdftoppm`), images, texte extrait des documents Word/Excel/code, contenu des dossiers.
-- **Intégration Dropbox** : icône `󰇣` automatique et copie directe d'un **lien de partage Dropbox** avec `Ctrl + L`.
+Includes both a **centered Spotlight overlay** and a **top-bar magnifying glass widget**.
 
-## Raccourcis dans l'overlay
+## Features
 
-| Touche | Action |
-|---|---|
-| `Entrée` | Ouvrir le fichier ou dossier |
-| `Ctrl + Entrée` | Révéler le fichier dans le gestionnaire de fichiers |
-| `Shift + Entrée` | Parcourir ce sous-dossier dans la barre (si dossier) |
-| `Tab` / `Ctrl + G` | Basculer entre recherche par **Noms** et par **Contenu** |
-| `Ctrl + Y` | Copier le chemin complet dans le presse-papiers |
-| `Ctrl + L` | Générer et copier le lien de partage **Dropbox** |
-| `Ctrl + I` | Lancer / mettre en pause l'indexation cache PDF & Office |
-| `Ctrl + Suppr` | Déplacer le fichier sélectionné dans la corbeille |
-| `Échap` | Effacer la recherche, puis fermer |
+- **Instant Filename Search (`Names` mode)** — Fuzzy path matching over `~` via `fd` + `fzf --scheme=path` (~25–200 ms across 200k+ files, symmetric Unicode/accent normalization).
+- **Document Content Search (`Content` mode)** — Searches inside **PDF**, **Word (`.docx`)**, **Excel (`.xlsx`)**, **PowerPoint (`.pptx`)**, **OpenDocument (`.odt`, `.ods`, `.odp`)**, and plain-text/Markdown/code files using a local incremental **SQLite FTS5** cache (`unicode61 remove_diacritics 2`) combined with live `ripgrep`.
+- **Live Split Preview** — Renders PDF first-page previews (`pdftoppm`), images, extracted Office/PDF text snippets around your search terms, plain-text/code files, and folder contents.
+- **Top-Bar Icon (`bar-widget`)** — Native `BarIconButton` that adapts to your live Omarchy theme:
+  - **Left-click**: toggle Spotlight overlay in filename mode.
+  - **Right-click**: summon Spotlight overlay directly in document content mode.
+- **Dropbox Integration** — Automatically detects personal and business Dropbox roots (`~/.dropbox/info.json`), badges synced items, and copies public Dropbox share links (`Ctrl+L`) via `dropbox-cli`.
+- **Zero Background Daemon** — Runs strictly on demand in user space with no elevated privileges (`No sudo or pkexec is required`).
+- **Live Theme & Localization** — Follows Omarchy theme switches and language changes live (`en` and `fr` bundled).
 
-## Développement & mise à jour
+## Installation
 
-Le code source vit dans `/home/thibaud/Work/thibaud-files` et est installé dans `~/.config/omarchy/plugins/thibaud.files`.
-
-Après modification dans `~/Work/thibaud-files` :
+Add and enable the plugin with the Omarchy CLI:
 
 ```bash
-git -C ~/Work/thibaud-files commit -am "Update plugin"
-omarchy plugin update thibaud.files --yes
+omarchy plugin add https://github.com/ThibaudBerdin/omarchy-spotlight-files --enable
 ```
 
-## Configuration optionnelle
+Enabling the plugin places the magnifying glass icon in the right section of your top bar by default. You can reposition it anywhere on the bar, for example right next to Dropbox:
 
-Créer `~/.config/omarchy/thibaud-files.json` pour personnaliser les dossiers exclus :
+```bash
+omarchy bar move io.github.thibaudberdin.spotlight-files --after omarchy.dropbox
+```
+
+### Optional Hyprland Keybinding
+
+The plugin does not modify your Hyprland configuration automatically. To bind `SUPER + D` (or any shortcut of your choice), add the following line to `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + D", "Spotlight Files", { panel = "io.github.thibaudberdin.spotlight-files" })
+```
+
+You can also toggle or summon specific modes from the command line:
+
+```bash
+omarchy-shell shell toggle io.github.thibaudberdin.spotlight-files
+omarchy-shell shell summon io.github.thibaudberdin.spotlight-files '{"mode":"content"}'
+```
+
+## Removal
+
+Remove the plugin with the Omarchy CLI:
+
+```bash
+omarchy plugin remove io.github.thibaudberdin.spotlight-files
+```
+
+If you added a custom keybinding in `~/.config/hypr/bindings.lua`, remove that line as well. To delete the local search/preview cache and optional config file:
+
+```bash
+rm -rf ~/.cache/io.github.thibaudberdin.spotlight-files ~/.config/omarchy/spotlight-files.json
+```
+
+## External Dependencies
+
+All core dependencies are standard userland utilities preinstalled on Omarchy / Arch Linux:
+
+| Dependency | Binary | Purpose | Required |
+|---|---|---|---|
+| `python` | `python3` | Search, XML Office extraction, and SQLite FTS5 backend | Yes |
+| `fd` | `fd` | Fast filesystem path and recent-file discovery | Yes |
+| `fzf` | `fzf` | Fuzzy path ranking (`--scheme=path`) | Yes |
+| `ripgrep` | `rg` | Live plain-text, Markdown, CSV, and code content search | Yes |
+| `poppler` | `pdftotext`, `pdftoppm` | PDF text extraction and page-1 visual preview | Recommended |
+| `glib2` | `gdbus`, `gio` | Reveal in file manager (`FileManager1`) and move to trash | Yes |
+| `wl-clipboard` | `wl-copy` | Copy file paths and Dropbox links to Wayland clipboard | Yes |
+| `xdg-utils` | `xdg-open` | Open files and folders in default desktop apps | Yes |
+| `dropbox-cli` | `dropbox-cli` | Generate Dropbox share links (`Ctrl+L`) | Optional |
+
+## Keyboard Shortcuts & Search Prefixes
+
+| Key / Prefix | Action |
+|---|---|
+| `Enter` | Open selected file or folder |
+| `Ctrl + Enter` | Reveal selected item in file manager |
+| `Shift + Enter` | Filter inside the selected folder |
+| `Tab` / `Ctrl + G` | Switch between **Names** and **Content** modes |
+| `Ctrl + I` | Start/stop incremental FTS5 indexing of all PDFs & Office documents |
+| `Ctrl + Y` | Copy full path to clipboard |
+| `Ctrl + L` | Copy Dropbox share link to clipboard (for files inside Dropbox) |
+| `Ctrl + Delete` | Move selected item to trash |
+| `Esc` | Clear search input, or close overlay if empty |
+| `?query` or `c:query` | Search inside document contents directly from Names mode |
+| `pdf:`, `doc:`, `xls:`, `img:`, `dir:` | Restrict results by type (chainable, e.g. `?pdf: invoice`) |
+
+## Configuration (Optional)
+
+You can customize excluded directories and the maximum indexed text size per document by creating `~/.config/omarchy/spotlight-files.json`:
 
 ```json
 {
-  "excludes": [".git", "node_modules", "__MACOSX", "target", "venv"],
+  "excludes": [
+    ".git",
+    "node_modules",
+    "__MACOSX",
+    ".dropbox",
+    ".dropbox-dist",
+    ".dropbox.cache",
+    "target",
+    "venv",
+    ".venv",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build"
+  ],
   "maxIndexedTextBytes": 350000
 }
 ```
+
+## License
+
+Released under the [MIT License](LICENSE).
