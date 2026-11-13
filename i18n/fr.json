@@ -1,0 +1,27 @@
+{
+  "search.placeholderName": "Rechercher un fichier ou dossier… (?mot pour le contenu)",
+  "search.placeholderContent": "Rechercher dans le texte des PDF, Word, Excel, notes…",
+  "mode.name": "Noms",
+  "mode.content": "Contenu",
+  "status.recent": "Récents",
+  "status.searching": "Recherche…",
+  "status.indexing": "Indexation %1 / %2 (%3 %)",
+  "status.results": {
+    "one": "%1 résultat",
+    "other": "%1 résultats"
+  },
+  "status.cachedDocs": "%1 docs en cache",
+  "empty.noMatches": "Aucun résultat pour « %1 »",
+  "empty.noRecent": "Tape quelques lettres pour chercher dans tes dossiers et Dropbox",
+  "empty.contentHint": "Astuce : Ctrl+I pré-indexe tous tes PDF/Word/Excel en cache local",
+  "preview.emptyFolder": "Dossier vide",
+  "preview.loading": "Chargement de l’aperçu…",
+  "preview.noText": "Aucun texte extractible",
+  "footer.open": "⏎ Ouvrir",
+  "footer.reveal": "Ctrl+⏎ Dossier",
+  "footer.mode": "Tab Nom/Contenu",
+  "footer.copy": "Ctrl+Y Chemin",
+  "footer.dropbox": "Ctrl+L Lien Dropbox",
+  "footer.index": "Ctrl+I Indexer docs",
+  "footer.stopIndex": "Ctrl+I Stopper"
+}

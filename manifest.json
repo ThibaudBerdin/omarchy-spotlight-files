@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "thibaud.files",
+  "name": "Spotlight Files",
+  "version": "0.1.0",
+  "author": "Thibaud",
+  "license": "MIT",
+  "description": "Spotlight-style file and document search for Omarchy (filenames via fd/fzf + on-demand PDF/Office content search via SQLite FTS5 & ripgrep, live preview, Dropbox link copy, zero background daemon).",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Files.qml"
+  }
+}

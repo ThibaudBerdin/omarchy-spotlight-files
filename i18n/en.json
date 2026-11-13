@@ -1,0 +1,27 @@
+{
+  "search.placeholderName": "Search files and folders… (?query for content)",
+  "search.placeholderContent": "Search inside PDFs, Office & text documents…",
+  "mode.name": "Names",
+  "mode.content": "Content",
+  "status.recent": "Recent",
+  "status.searching": "Searching…",
+  "status.indexing": "Indexing %1 / %2 (%3%)",
+  "status.results": {
+    "one": "%1 result",
+    "other": "%1 results"
+  },
+  "status.cachedDocs": "%1 cached docs",
+  "empty.noMatches": "No matches for \"%1\"",
+  "empty.noRecent": "Type to search your files and Dropbox",
+  "empty.contentHint": "Press Ctrl+I to index all PDFs & Office files into local cache",
+  "preview.emptyFolder": "Empty folder",
+  "preview.loading": "Loading preview…",
+  "preview.noText": "No extractable text",
+  "footer.open": "⏎ Open",
+  "footer.reveal": "Ctrl+⏎ Folder",
+  "footer.mode": "Tab Name/Content",
+  "footer.copy": "Ctrl+Y Path",
+  "footer.dropbox": "Ctrl+L Dropbox link",
+  "footer.index": "Ctrl+I Index docs",
+  "footer.stopIndex": "Ctrl+I Stop index"
+}
