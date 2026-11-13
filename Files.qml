@@ -13,11 +13,15 @@ Item {
   property var shell: null
   property var manifest: null
 
-  readonly property string helperScript: decodeURIComponent(String(Qt.resolvedUrl("search.py")).replace(/^file:\/\//, ""))
+  // Resolve plugin directory whether loaded via qs:/// or file:/// or injected via manifest.__sourceDir
+  readonly property string pluginDir: (manifest && manifest.__sourceDir)
+    ? String(manifest.__sourceDir).replace(/\/+$/, "")
+    : decodeURIComponent(String(Qt.resolvedUrl(".")).replace(/^(file|qs):\/\//, "")).replace(/\/+$/, "")
+  readonly property string helperScript: pluginDir + "/search.py"
 
   Commons.Translations {
     id: strings
-    directory: Qt.resolvedUrl("i18n")
+    directory: root.pluginDir + "/i18n"
   }
 
   property bool opened: false
@@ -31,6 +35,12 @@ Item {
   property bool isRecent: true
   property bool searching: false
   property int cachedDocs: 0
+
+  // Plain value snapshot of currently selected row (immune to ListModel clear/invalidate)
+  property string selectedPath: ""
+  property string selectedName: ""
+  property bool selectedIsDir: false
+  property bool selectedInDropbox: false
 
   property bool indexing: indexProc.running
   property int indexDone: 0
@@ -62,9 +72,20 @@ Item {
   property int rowHeight: Math.max(Style.space(54), Style.font.body + Style.font.caption + Style.spacing.rowPaddingX * 2)
   property int snippetRowHeight: Math.max(Style.space(68), Style.font.body + Style.font.caption * 2 + Style.spacing.rowPaddingX * 2)
 
-  readonly property var activeRow: (displayModel.count > 0 && selectedIndex >= 0 && selectedIndex < displayModel.count)
-    ? displayModel.get(selectedIndex)
-    : null
+  function syncSelection() {
+    if (root.cursorActive && displayModel.count > 0 && root.selectedIndex >= 0 && root.selectedIndex < displayModel.count) {
+      var r = displayModel.get(root.selectedIndex)
+      root.selectedPath = String(r.path || "")
+      root.selectedName = String(r.name || "")
+      root.selectedIsDir = r.isDir === true
+      root.selectedInDropbox = r.inDropbox === true
+    } else {
+      root.selectedPath = ""
+      root.selectedName = ""
+      root.selectedIsDir = false
+      root.selectedInDropbox = false
+    }
+  }
 
   function open(payloadJson) {
     var payload = ({})
@@ -75,6 +96,7 @@ Item {
       root.searchMode = payload.mode
     }
     root.filterText = ""
+    filterInput.text = ""
     root.selectedIndex = 0
     root.cursorActive = true
     root.disarmPointer()
@@ -103,9 +125,10 @@ Item {
 
   function selectFromPointer(index, item, mouse) {
     if (!pointerGate.moved(item, mouse)) return
-    if (root.selectedIndex !== index) {
+    if (root.selectedIndex !== index || !root.cursorActive) {
       root.cursorActive = true
       root.selectedIndex = index
+      root.syncSelection()
       root.schedulePreview()
     }
   }
@@ -146,6 +169,7 @@ Item {
     } else {
       root.selectedIndex = (root.selectedIndex + delta + displayModel.count) % displayModel.count
     }
+    root.syncSelection()
     resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
     root.schedulePreview()
   }
@@ -155,45 +179,38 @@ Item {
     root.disarmPointer()
     root.cursorActive = true
     root.selectedIndex = Math.max(0, Math.min(index, displayModel.count - 1))
+    root.syncSelection()
     resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
     root.schedulePreview()
   }
 
-  function currentPath() {
-    if (displayModel.count === 0 || root.selectedIndex < 0 || root.selectedIndex >= displayModel.count) return ""
-    return displayModel.get(root.selectedIndex).path || ""
-  }
-
   function activateSelected(revealInFolder) {
-    var p = root.currentPath()
+    var p = root.selectedPath
     if (!p) return
     root.close()
-    if (revealInFolder) {
-      Util.execArgv(["python3", root.helperScript, "action", "reveal", p])
-    } else {
-      Util.execArgv(["xdg-open", p])
-    }
+    var kind = revealInFolder ? "reveal" : "open"
+    Util.execArgv(["python3", root.helperScript, "action", kind, "--", p])
   }
 
   function copySelectedPath() {
-    var p = root.currentPath()
+    var p = root.selectedPath
     if (!p) return
     root.close()
-    Util.execArgv(["python3", root.helperScript, "action", "copy-path", p])
+    Util.execArgv(["python3", root.helperScript, "action", "copy-path", "--", p])
   }
 
   function copyDropboxLink() {
-    var p = root.currentPath()
-    if (!p) return
+    var p = root.selectedPath
+    if (!p || !root.selectedInDropbox) return
     root.close()
-    Util.execArgv(["python3", root.helperScript, "action", "dropbox-link", p])
+    Util.execArgv(["python3", root.helperScript, "action", "dropbox-link", "--", p])
   }
 
   function trashSelected() {
-    var p = root.currentPath()
+    var p = root.selectedPath
     if (!p) return
     trashProc.targetPath = p
-    trashProc.command = ["python3", root.helperScript, "action", "trash", p]
+    trashProc.command = ["python3", root.helperScript, "action", "trash", "--", p]
     trashProc.running = true
   }
 
@@ -208,7 +225,7 @@ Item {
       root.dispatchQuery()
     } else {
       var wantContent = root.searchMode === "content" || /^\s*(\?|c:)/i.test(root.filterText)
-      queryTimer.interval = wantContent ? 150 : 65
+      queryTimer.interval = wantContent ? 130 : 60
       queryTimer.start()
     }
   }
@@ -248,7 +265,14 @@ Item {
       root.pendingQuerySpec = null
       activeSerial = spec.serial
       collected = ""
-      command = ["python3", root.helperScript, "query", "--mode", spec.mode, "--limit", "55", spec.query]
+      command = [
+        "python3",
+        root.helperScript,
+        "query",
+        "--mode=" + spec.mode,
+        "--limit=55",
+        "--text=" + spec.query
+      ]
       running = true
     }
 
@@ -296,10 +320,12 @@ Item {
 
     if (displayModel.count === 0) {
       root.selectedIndex = 0
+      root.syncSelection()
       root.clearPreview()
     } else {
       if (root.selectedIndex >= displayModel.count) root.selectedIndex = displayModel.count - 1
       if (root.selectedIndex < 0) root.selectedIndex = 0
+      root.syncSelection()
       Qt.callLater(function() {
         if (displayModel.count > 0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
       })
@@ -319,12 +345,12 @@ Item {
     root.previewMeta = ""
     root.previewInDropbox = false
     root.previewLoading = false
+    previewFlickable.contentY = 0
   }
 
   function schedulePreview() {
     previewTimer.stop()
-    var p = root.currentPath()
-    if (!p) {
+    if (!root.selectedPath) {
       root.clearPreview()
       return
     }
@@ -336,7 +362,7 @@ Item {
     interval: 75
     repeat: false
     onTriggered: {
-      var p = root.currentPath()
+      var p = root.selectedPath
       if (!p) {
         root.clearPreview()
         return
@@ -370,7 +396,14 @@ Item {
       root.pendingPreviewSpec = null
       activeSerial = spec.serial
       collected = ""
-      command = ["python3", root.helperScript, "preview", "--query", spec.query, spec.path]
+      command = [
+        "python3",
+        root.helperScript,
+        "preview",
+        "--query=" + spec.query,
+        "--",
+        spec.path
+      ]
       running = true
     }
 
@@ -389,6 +422,7 @@ Item {
       var data = null
       try { data = JSON.parse(collected) } catch (e) { data = null }
       if (!data) return
+      previewFlickable.contentY = 0
       root.previewKind = String(data.kind || "")
       root.previewImageUrl = data.imagePath ? Util.fileUrl(String(data.imagePath)) : ""
       root.previewText = String(data.text || "")
@@ -485,7 +519,10 @@ Item {
       borderSpec: root.borderSpec
       padding: root.contentMargin
 
-      MouseArea { anchors.fill: parent; onClicked: {} }
+      MouseArea {
+        anchors.fill: parent
+        onClicked: filterInput.forceActiveFocus()
+      }
 
       Item {
         id: keyCatcher
@@ -536,8 +573,8 @@ Item {
             root.selectAbsolute(displayModel.count - 1)
             event.accepted = true
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-            if (shift && root.activeRow && root.activeRow.isDir) {
-              var rel = root.activeRow.path
+            if (shift && root.selectedIsDir && root.selectedPath) {
+              var rel = root.selectedPath
               var homePrefix = Quickshell.env("HOME") + "/"
               if (rel.indexOf(homePrefix) === 0) rel = rel.slice(homePrefix.length)
               root.setFilter(rel + "/")
@@ -676,9 +713,10 @@ Item {
         }
 
         // Main split area: Results list (left) + Live Preview (right)
+        // 5 children in Column => 4 spacings (root.contentSpacing * 4)
         Item {
           width: parent.width
-          height: parent.height - root.headerHeight - root.footerHeight - root.contentSpacing * 3 - Style.normalBorderWidth * 2
+          height: Math.max(0, parent.height - root.headerHeight - root.footerHeight - root.contentSpacing * 4 - Style.normalBorderWidth * 2)
 
           Row {
             anchors.fill: parent
@@ -805,6 +843,7 @@ Item {
                     onClicked: function(mouse) {
                       root.cursorActive = true
                       root.selectedIndex = rowItem.index
+                      root.syncSelection()
                       root.activateSelected((mouse.modifiers & Qt.ControlModifier) !== 0)
                     }
                   }
@@ -827,18 +866,20 @@ Item {
               }
 
               Column {
+                id: previewColumn
                 anchors.fill: parent
                 anchors.leftMargin: root.contentMargin
                 spacing: Style.space(8)
 
                 // Preview header: filename + metadata
                 Column {
+                  id: previewHeader
                   width: parent.width
                   spacing: Style.space(2)
 
                   Text {
                     textFormat: Text.PlainText
-                    text: root.activeRow ? root.activeRow.name : ""
+                    text: root.selectedName
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.title
@@ -869,7 +910,7 @@ Item {
                 // Preview body
                 Item {
                   width: parent.width
-                  height: parent.height - Style.space(52)
+                  height: Math.max(0, parent.height - previewHeader.height - Style.normalBorderWidth - previewColumn.spacing * 2)
                   clip: true
 
                   SizedImage {
@@ -884,6 +925,7 @@ Item {
                   }
 
                   Flickable {
+                    id: previewFlickable
                     visible: root.previewText.length > 0
                     anchors.top: root.previewImageUrl.length > 0 ? imgPreview.bottom : parent.top
                     anchors.topMargin: root.previewImageUrl.length > 0 ? Style.space(8) : 0
@@ -981,6 +1023,7 @@ Item {
           width: parent.width
           height: root.footerHeight
           spacing: Style.space(16)
+          clip: true
 
           Text {
             textFormat: Text.PlainText
@@ -1023,7 +1066,7 @@ Item {
           }
 
           Text {
-            visible: root.activeRow !== null && root.activeRow.inDropbox
+            visible: root.selectedInDropbox
             textFormat: Text.PlainText
             text: strings.t("footer.dropbox")
             color: root.foreground

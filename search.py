@@ -2,9 +2,9 @@
 """Spotlight-style search & preview backend for thibaud.files (Omarchy Quickshell).
 
 Zero permanent background daemon:
-- Filename search: fd + fzf --scheme=path over cached relative paths (~25ms on 220k files).
+- Filename search: fd + fzf --scheme=path over cached relative paths (~25-200ms on 220k files).
 - Content search: SQLite FTS5 local cache (unicode61 remove_diacritics 2) for PDFs & Office
-  documents + live ripgrep (rg) for text/markdown/code + bounded on-demand extraction.
+  documents + live ripgrep (rg --null) for text/markdown/code.
 - Preview: PDF page rendering (pdftoppm), images, Office XML text, text/code, folder listing.
 """
 
@@ -104,11 +104,14 @@ def detect_dropbox_roots() -> list[Path]:
                             roots.append(rp)
         except Exception:
             pass
-    for child in HOME.iterdir():
-        if child.is_dir() and "dropbox" in child.name.lower() and not child.name.startswith("."):
-            rp = child.resolve()
-            if rp not in roots:
-                roots.append(rp)
+    try:
+        for child in HOME.iterdir():
+            if child.is_dir() and "dropbox" in child.name.lower() and not child.name.startswith("."):
+                rp = child.resolve()
+                if rp not in roots:
+                    roots.append(rp)
+    except OSError:
+        pass
     return roots
 
 
@@ -230,26 +233,30 @@ def refresh_paths_cache() -> int:
             fh.write("\n")
     os.replace(tmp_name, PATHS_CACHE)
 
-    # Compute top 35 recent files from shallower/active folders + top modified
+    # Compute top 35 recent files across ALL directories without alphabetical truncation
     recent_candidates: list[tuple[float, Path]] = []
-    # Fast recent scan using fd --changed-within 60d -t f
-    rec_cmd = fd_base_cmd(cfg) + ["-t", "f", "--changed-within", "60d", "."]
-    rec_proc = subprocess.run(
-        rec_cmd,
-        cwd=str(HOME),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=False,
-    )
-    for rel in rec_proc.stdout.splitlines()[:4000]:
-        if not rel:
-            continue
-        p = HOME / rel
-        try:
-            recent_candidates.append((p.stat().st_mtime, p))
-        except OSError:
-            continue
+    for window in ("14d", "90d"):
+        rec_cmd = fd_base_cmd(cfg) + ["-t", "f", "--changed-within", window, "."]
+        rec_proc = subprocess.run(
+            rec_cmd,
+            cwd=str(HOME),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        recent_candidates.clear()
+        for rel in rec_proc.stdout.splitlines():
+            if not rel:
+                continue
+            p = HOME / rel
+            try:
+                recent_candidates.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
+        if len(recent_candidates) >= 35:
+            break
+
     recent_candidates.sort(key=lambda x: x[0], reverse=True)
     recent_items = []
     for _, p in recent_candidates[:35]:
@@ -261,6 +268,12 @@ def refresh_paths_cache() -> int:
     with os.fdopen(fd_rtmp, "w", encoding="utf-8") as fh:
         json.dump(recent_items, fh, ensure_ascii=False)
     os.replace(rtmp_name, RECENT_CACHE)
+
+    # Opportunistically index recently modified PDF/Office docs (last 14 days) in background
+    con = open_fts()
+    opportunistic_index_recent(con, cfg, window="14d", budget_sec=0.35)
+    con.close()
+
     return len(lines)
 
 
@@ -502,35 +515,92 @@ def make_snippet_around(text: str, query: str, window: int = 140) -> str:
     return prefix + " ".join(text[start:end].split()) + suffix
 
 
+def opportunistic_index_recent(con: sqlite3.Connection, cfg: dict, window: str = "14d", budget_sec: float = 0.35) -> None:
+    """Point-checks only recently modified documents without loading the entire docs_meta table."""
+    deadline = time.monotonic() + budget_sec
+    cmd = fd_base_cmd(cfg) + ["-t", "f"]
+    for ext in sorted(DOC_EXTS):
+        cmd.extend(["-e", ext.lstrip(".")])
+    cmd.extend(["--changed-within", window, "."])
+    proc = subprocess.run(
+        cmd,
+        cwd=str(HOME),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    candidates: list[tuple[int, Path, int]] = []
+    for rel in proc.stdout.splitlines():
+        if not rel:
+            continue
+        p = HOME / rel
+        if p.name.startswith("._") or "__MACOSX" in p.parts:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        row = con.execute("SELECT mtime_ns, size FROM docs_meta WHERE path = ?", (str(p),)).fetchone()
+        if row and row[0] == st.st_mtime_ns and row[1] == st.st_size:
+            continue
+        candidates.append((st.st_mtime_ns, p, st.st_size))
+
+    if not candidates:
+        return
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    max_bytes = int(cfg.get("maxIndexedTextBytes", 350_000))
+    rows_to_save: list[tuple[str, str, str, int, int]] = []
+    for mtime_ns, p, size in candidates[:24]:
+        if time.monotonic() >= deadline:
+            break
+        body = extract_document_text(p, max_bytes=max_bytes)
+        rows_to_save.append((str(p), p.name, body, mtime_ns, size))
+
+    if rows_to_save:
+        with con:
+            for sp, name, body, mtime_ns, size in rows_to_save:
+                con.execute("DELETE FROM docs_fts WHERE path = ?", (sp,))
+                con.execute("INSERT INTO docs_fts(path, name, body) VALUES (?, ?, ?)", (sp, name, body))
+                con.execute(
+                    "INSERT OR REPLACE INTO docs_meta(path, mtime_ns, size) VALUES (?, ?, ?)",
+                    (sp, mtime_ns, size),
+                )
+
+
 # ---------------- Search implementations ----------------
 
 
 def parse_prefix(raw_query: str, explicit_mode: str) -> tuple[str, str, str]:
-    """Returns (mode, filter_kind, clean_query)."""
+    """Supports chained prefixes like '?pdf: devis' or 'c: xls: budget'."""
     q = raw_query.strip()
     mode = explicit_mode
     filter_kind = "all"
 
-    if q.startswith("?"):
-        return "content", "all", q[1:].strip()
-
-    m = re.match(r"^(c|d|dir|pdf|doc|xls|img):(.*)$", q, flags=re.IGNORECASE)
-    if m:
-        tag = m.group(1).lower()
-        rest = m.group(2).strip()
-        if tag == "c":
+    for _ in range(3):
+        if q.startswith("?"):
             mode = "content"
-        elif tag in ("d", "dir"):
-            filter_kind = "dir"
-        elif tag == "pdf":
-            filter_kind = "pdf"
-        elif tag == "doc":
-            filter_kind = "doc"
-        elif tag == "xls":
-            filter_kind = "xls"
-        elif tag == "img":
-            filter_kind = "img"
-        q = rest
+            q = q[1:].strip()
+            continue
+        m = re.match(r"^(c|d|dir|pdf|doc|xls|img):(.*)$", q, flags=re.IGNORECASE)
+        if m:
+            tag = m.group(1).lower()
+            q = m.group(2).strip()
+            if tag == "c":
+                mode = "content"
+            elif tag in ("d", "dir"):
+                filter_kind = "dir"
+            elif tag == "pdf":
+                filter_kind = "pdf"
+            elif tag == "doc":
+                filter_kind = "doc"
+            elif tag == "xls":
+                filter_kind = "xls"
+            elif tag == "img":
+                filter_kind = "img"
+            continue
+        break
 
     return mode, filter_kind, q
 
@@ -558,7 +628,10 @@ def search_names(query: str, filter_kind: str, limit: int) -> list[dict]:
     if not PATHS_CACHE.is_file():
         refresh_paths_cache()
 
-    cmd = ["fzf", "--filter", query, "--scheme=path"]
+    # Strip accents on the query so fzf's built-in Unicode normalization matches
+    # symmetrically whether the query or the filename on disk carries accents.
+    norm_q = strip_accents(query)
+    cmd = ["fzf", f"--filter={norm_q}", "--scheme=path"]
     try:
         with open(PATHS_CACHE, "rb") as fh:
             proc = subprocess.run(
@@ -587,76 +660,22 @@ def search_names(query: str, filter_kind: str, limit: int) -> list[dict]:
     return results
 
 
-def iter_uncached_docs(con: sqlite3.Connection, cfg: dict, max_candidates: int = 80) -> list[tuple[Path, int, int]]:
-    """Find recently changed uncached PDF/Office docs for opportunistic on-demand indexing."""
-    known = {row[0]: (row[1], row[2]) for row in con.execute("SELECT path, mtime_ns, size FROM docs_meta")}
-    cmd = fd_base_cmd(cfg) + ["-t", "f"]
-    for ext in sorted(DOC_EXTS):
-        cmd.extend(["-e", ext.lstrip(".")])
-    cmd.extend(["--changed-within", "365d", "."])
-    proc = subprocess.run(
-        cmd,
-        cwd=str(HOME),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=False,
-    )
-    candidates: list[tuple[int, Path, int]] = []
-    for rel in proc.stdout.splitlines():
-        if not rel:
-            continue
-        p = HOME / rel
-        sp = str(p)
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        prev = known.get(sp)
-        if prev and prev[0] == st.st_mtime_ns and prev[1] == st.st_size:
-            continue
-        candidates.append((st.st_mtime_ns, p, st.st_size))
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return [(p, mtime_ns, size) for mtime_ns, p, size in candidates[:max_candidates]]
-
-
-def opportunistic_index_step(con: sqlite3.Connection, cfg: dict, budget_sec: float = 0.38) -> None:
-    deadline = time.monotonic() + budget_sec
-    todo = iter_uncached_docs(con, cfg, max_candidates=24)
-    if not todo:
-        return
-    max_bytes = int(cfg.get("maxIndexedTextBytes", 350_000))
-    rows_to_save: list[tuple[str, str, str, int, int]] = []
-    for p, mtime_ns, size in todo:
-        if time.monotonic() >= deadline:
-            break
-        body = extract_document_text(p, max_bytes=max_bytes)
-        rows_to_save.append((str(p), p.name, body, mtime_ns, size))
-    if rows_to_save:
-        with con:
-            for sp, name, body, mtime_ns, size in rows_to_save:
-                con.execute("DELETE FROM docs_fts WHERE path = ?", (sp,))
-                con.execute("INSERT INTO docs_fts(path, name, body) VALUES (?, ?, ?)", (sp, name, body))
-                con.execute(
-                    "INSERT OR REPLACE INTO docs_meta(path, mtime_ns, size) VALUES (?, ?, ?)",
-                    (sp, mtime_ns, size),
-                )
-
-
 def search_content(query: str, filter_kind: str, limit: int) -> tuple[list[dict], int]:
     cfg = load_config()
     con = open_fts()
-
-    # Opportunistically cache recent PDF/Office docs within ~350ms so fresh files are immediately searchable
-    opportunistic_index_step(con, cfg, budget_sec=0.35)
     cached_count = fts_stats(con)
+
+    # Cold-start helper if the user hasn't indexed anything yet
+    if cached_count < 20:
+        opportunistic_index_recent(con, cfg, window="365d", budget_sec=0.28)
+        cached_count = fts_stats(con)
 
     seen: set[str] = set()
     results: list[dict] = []
 
-    # 1. Instant SQLite FTS5 query across cached PDFs & Office docs
+    # 1. Instant SQLite FTS5 query across cached PDFs & Office docs (<10ms)
     fts_q = build_fts_query(query)
-    if fts_q:
+    if fts_q and filter_kind != "dir":
         try:
             rows = con.execute(
                 """
@@ -684,7 +703,7 @@ def search_content(query: str, filter_kind: str, limit: int) -> tuple[list[dict]
 
     con.close()
 
-    # 2. Live ripgrep (rg) across plain-text / Markdown / CSV / code files
+    # 2. Live ripgrep (rg --null) across plain-text / Markdown / CSV / code files
     if len(results) < limit and filter_kind in ("all", "doc", "xls"):
         rg_cmd = [
             "rg",
@@ -692,6 +711,7 @@ def search_content(query: str, filter_kind: str, limit: int) -> tuple[list[dict]
             "--max-count=1",
             "--no-heading",
             "--with-filename",
+            "--null",
             "--max-filesize=5M",
             "--color=never",
         ]
@@ -716,7 +736,7 @@ def search_content(query: str, filter_kind: str, limit: int) -> tuple[list[dict]
             out_text = ""
 
         for line in out_text.splitlines():
-            sep = line.find(":")
+            sep = line.find("\x00")
             if sep <= 0:
                 continue
             rel = line[:sep].lstrip("./")
@@ -841,7 +861,7 @@ def render_pdf_page1(path: Path, mtime_ns: int) -> str:
     prefix = PREVIEW_DIR / key
     try:
         subprocess.run(
-            ["pdftoppm", "-png", "-r", "110", "-f", "1", "-l", "1", "-singlefile", str(path), str(prefix)],
+            ["pdftoppm", "-png", "-r", "110", "-f", "1", "-l", "1", "-singlefile", "--", str(path), str(prefix)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=3.0,
@@ -902,14 +922,13 @@ def build_preview(path_str: str, query: str = "") -> dict:
     if ext == ".pdf":
         img = render_pdf_page1(p, st.st_mtime_ns)
         snippet = ""
-        if query.strip():
-            # Pull cached body from FTS first if present, else quick page text
+        if query.strip() or not img:
             try:
                 con = open_fts()
                 row = con.execute("SELECT body FROM docs_fts WHERE path = ? LIMIT 1", (str(p),)).fetchone()
                 con.close()
                 body = row[0] if row and row[0] else extract_pdf(p, 80_000, timeout_sec=1.5)
-                snippet = make_snippet_around(body, query, window=260)
+                snippet = make_snippet_around(body, query, window=260) if query.strip() else body[:2500].strip()
             except Exception:
                 snippet = ""
         return {
@@ -972,6 +991,11 @@ def build_preview(path_str: str, query: str = "") -> dict:
     }
 
 
+def launch_detached_xdg_open(target: Path) -> None:
+    cmd = ["uwsm-app", "--", "xdg-open", str(target)] if shutil.which("uwsm-app") else ["xdg-open", str(target)]
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def notify(headline: str, description: str = "", glyph: str = "󰈔") -> None:
     if shutil.which("omarchy-notification-send"):
         subprocess.run(
@@ -987,9 +1011,13 @@ def run_action(action: str, path_str: str) -> int:
     if not p.exists():
         return 1
 
+    if action == "open":
+        launch_detached_xdg_open(p)
+        return 0
+
     if action == "reveal":
         if p.is_dir():
-            subprocess.Popen(["xdg-open", str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            launch_detached_xdg_open(p)
             return 0
         uri = "file://" + urllib.parse.quote(str(p.resolve()))
         res = subprocess.run(
@@ -1012,7 +1040,7 @@ def run_action(action: str, path_str: str) -> int:
             check=False,
         )
         if res.returncode != 0:
-            subprocess.Popen(["xdg-open", str(p.parent)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            launch_detached_xdg_open(p.parent)
         return 0
 
     if action == "dropbox-link":
@@ -1060,6 +1088,7 @@ def main() -> int:
     pq = sub.add_parser("query")
     pq.add_argument("--mode", choices=("name", "content"), default="name")
     pq.add_argument("--limit", type=int, default=50)
+    pq.add_argument("--text", default=None)
     pq.add_argument("query", nargs="?", default="")
 
     pp = sub.add_parser("preview")
@@ -1067,7 +1096,7 @@ def main() -> int:
     pp.add_argument("path")
 
     pa = sub.add_parser("action")
-    pa.add_argument("kind", choices=("reveal", "dropbox-link", "copy-path", "trash"))
+    pa.add_argument("kind", choices=("open", "reveal", "dropbox-link", "copy-path", "trash"))
     pa.add_argument("path")
 
     args = parser.parse_args()
@@ -1084,7 +1113,8 @@ def main() -> int:
         return run_index()
 
     if args.cmd == "query":
-        eff_mode, filter_kind, clean_q = parse_prefix(args.query, args.mode)
+        raw_q = args.text if args.text is not None else args.query
+        eff_mode, filter_kind, clean_q = parse_prefix(raw_q, args.mode)
         if not clean_q:
             con = open_fts()
             cached = fts_stats(con)
