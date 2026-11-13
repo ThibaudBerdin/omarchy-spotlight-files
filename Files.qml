@@ -448,7 +448,7 @@ Item {
           if (typeof st.cachedDocs === "number") root.cachedDocs = st.cachedDocs
         } catch (e) {}
       }
-      if (root.opened && !root.filterText.trim() && displayModel.count === 0) {
+      if (root.opened && !root.filterText.trim() && (displayModel.count === 0 || root.selectedIndex === 0)) {
         root.scheduleQuery(true)
       }
     }
