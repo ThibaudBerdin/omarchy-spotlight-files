@@ -37,6 +37,7 @@ Item {
   property int cachedDocs: 0
 
   // Plain value snapshot of currently selected row (immune to ListModel clear/invalidate)
+  property var resultRows: []
   property string selectedPath: ""
   property string selectedName: ""
   property bool selectedIsDir: false
@@ -73,10 +74,10 @@ Item {
   property int snippetRowHeight: Math.max(Style.space(68), Style.font.body + Style.font.caption * 2 + Style.spacing.rowPaddingX * 2)
 
   function syncSelection() {
-    if (root.cursorActive && displayModel.count > 0 && root.selectedIndex >= 0 && root.selectedIndex < displayModel.count) {
-      var r = displayModel.get(root.selectedIndex)
+    if (root.cursorActive && root.resultRows.length > 0 && root.selectedIndex >= 0 && root.selectedIndex < root.resultRows.length) {
+      var r = root.resultRows[root.selectedIndex]
       root.selectedPath = String(r.path || "")
-      root.selectedName = String(r.name || "")
+      root.selectedName = String(r.fileName || "")
       root.selectedIsDir = r.isDir === true
       root.selectedInDropbox = r.inDropbox === true
     } else {
@@ -100,10 +101,11 @@ Item {
     filterInput.text = initialQuery
     root.selectedIndex = 0
     root.cursorActive = true
+    root.clearPreview()
     root.disarmPointer()
 
     if (!refreshProc.running) {
-      refreshProc.running = true
+      refreshProc.startRefresh()
     }
     root.scheduleQuery(true)
     Qt.callLater(function() { filterInput.forceActiveFocus() })
@@ -256,6 +258,9 @@ Item {
     id: queryProc
     property int activeSerial: 0
     property string collected: ""
+    property bool streamDone: false
+    property bool finishedExited: false
+    property int lastExitCode: -1
 
     function startPending() {
       if (!root.pendingQuerySpec) {
@@ -266,6 +271,9 @@ Item {
       root.pendingQuerySpec = null
       activeSerial = spec.serial
       collected = ""
+      streamDone = false
+      finishedExited = false
+      lastExitCode = -1
       command = [
         "python3",
         root.helperScript,
@@ -277,19 +285,34 @@ Item {
       running = true
     }
 
+    function tryFinish() {
+      if (root.pendingQuerySpec && !running) {
+        startPending()
+        return
+      }
+      if (!finishedExited || !streamDone) return
+      root.searching = false
+      if (lastExitCode !== 0 || activeSerial !== root.querySerial) return
+      root.applyQueryResponse(collected)
+    }
+
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: queryProc.collected = text
+      onStreamFinished: {
+        queryProc.collected = text
+        queryProc.streamDone = true
+        queryProc.tryFinish()
+      }
     }
 
     onExited: function(exitCode) {
+      finishedExited = true
+      lastExitCode = exitCode
       if (root.pendingQuerySpec) {
         startPending()
         return
       }
-      root.searching = false
-      if (exitCode !== 0 || activeSerial !== root.querySerial) return
-      root.applyQueryResponse(collected)
+      tryFinish()
     }
   }
 
@@ -305,26 +328,30 @@ Item {
     }
 
     var rows = Array.isArray(payload.results) ? payload.results : []
+    var cleanRows = []
     displayModel.clear()
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i]
-      displayModel.append({
+      var entry = {
         path: String(r.path || ""),
-        name: String(r.name || ""),
+        fileName: String(r.name || ""),
         dir: String(r.dir || ""),
         glyph: String(r.glyph || "󰈔"),
         isDir: r.isDir === true,
         inDropbox: r.inDropbox === true,
         snippet: String(r.snippet || "")
-      })
+      }
+      cleanRows.push(entry)
+      displayModel.append(entry)
     }
+    root.resultRows = cleanRows
 
-    if (displayModel.count === 0) {
+    if (cleanRows.length === 0) {
       root.selectedIndex = 0
       root.syncSelection()
       root.clearPreview()
     } else {
-      if (root.selectedIndex >= displayModel.count) root.selectedIndex = displayModel.count - 1
+      if (root.selectedIndex >= cleanRows.length) root.selectedIndex = cleanRows.length - 1
       if (root.selectedIndex < 0) root.selectedIndex = 0
       root.syncSelection()
       Qt.callLater(function() {
@@ -387,6 +414,9 @@ Item {
     id: previewProc
     property int activeSerial: 0
     property string collected: ""
+    property bool streamDone: false
+    property bool finishedExited: false
+    property int lastExitCode: -1
 
     function startPending() {
       if (!root.pendingPreviewSpec) {
@@ -397,6 +427,9 @@ Item {
       root.pendingPreviewSpec = null
       activeSerial = spec.serial
       collected = ""
+      streamDone = false
+      finishedExited = false
+      lastExitCode = -1
       command = [
         "python3",
         root.helperScript,
@@ -408,18 +441,14 @@ Item {
       running = true
     }
 
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: previewProc.collected = text
-    }
-
-    onExited: function(exitCode) {
-      if (root.pendingPreviewSpec) {
+    function tryFinish() {
+      if (root.pendingPreviewSpec && !running) {
         startPending()
         return
       }
+      if (!finishedExited || !streamDone) return
       root.previewLoading = false
-      if (exitCode !== 0 || activeSerial !== root.previewSerial) return
+      if (lastExitCode !== 0 || activeSerial !== root.previewSerial) return
       var data = null
       try { data = JSON.parse(collected) } catch (e) { data = null }
       if (!data) return
@@ -430,6 +459,25 @@ Item {
       root.previewMeta = String(data.meta || "")
       root.previewInDropbox = data.inDropbox === true
     }
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        previewProc.collected = text
+        previewProc.streamDone = true
+        previewProc.tryFinish()
+      }
+    }
+
+    onExited: function(exitCode) {
+      finishedExited = true
+      lastExitCode = exitCode
+      if (root.pendingPreviewSpec) {
+        startPending()
+        return
+      }
+      tryFinish()
+    }
   }
 
   // ---------------- Background cache refresh & on-demand indexing ----------------
@@ -437,13 +485,23 @@ Item {
   Process {
     id: refreshProc
     property string collected: ""
+    property bool streamDone: false
+    property bool finishedExited: false
+    property int lastExitCode: -1
     command: ["python3", root.helperScript, "refresh-paths"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: refreshProc.collected = text
+
+    function startRefresh() {
+      if (running) return
+      collected = ""
+      streamDone = false
+      finishedExited = false
+      lastExitCode = -1
+      running = true
     }
-    onExited: function(exitCode) {
-      if (exitCode === 0 && collected.trim()) {
+
+    function tryFinish() {
+      if (!finishedExited || !streamDone) return
+      if (lastExitCode === 0 && collected.trim()) {
         try {
           var st = JSON.parse(collected)
           if (typeof st.cachedDocs === "number") root.cachedDocs = st.cachedDocs
@@ -452,6 +510,21 @@ Item {
       if (root.opened && !root.filterText.trim() && (displayModel.count === 0 || root.selectedIndex === 0)) {
         root.scheduleQuery(true)
       }
+    }
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        refreshProc.collected = text
+        refreshProc.streamDone = true
+        refreshProc.tryFinish()
+      }
+    }
+
+    onExited: function(exitCode) {
+      finishedExited = true
+      lastExitCode = exitCode
+      tryFinish()
     }
   }
 
@@ -480,7 +553,7 @@ Item {
     property string targetPath: ""
     onExited: function(exitCode) {
       if (exitCode === 0) {
-        if (!refreshProc.running) refreshProc.running = true
+        refreshProc.startRefresh()
         root.scheduleQuery(true)
       }
     }
@@ -743,7 +816,7 @@ Item {
                   id: rowItem
                   required property int index
                   required property string path
-                  required property string name
+                  required property string fileName
                   required property string dir
                   required property string glyph
                   required property bool isDir
@@ -788,7 +861,7 @@ Item {
 
                         Text {
                           textFormat: Text.PlainText
-                          text: rowItem.name
+                          text: rowItem.fileName
                           color: rowItem.hasCursor ? root.selectedText : root.foreground
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.title
