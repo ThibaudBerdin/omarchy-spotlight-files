@@ -14,8 +14,8 @@ Includes both a **centered Spotlight overlay** and a **top-bar magnifying glass 
 - **Top-Bar Icon (`bar-widget`)** — Native `BarIconButton` that adapts to your live Omarchy theme:
   - **Left-click**: toggle Spotlight overlay in filename mode.
   - **Right-click**: summon Spotlight overlay directly in document content mode.
-- **Dropbox Integration** — Automatically detects personal and business Dropbox roots (`~/.dropbox/info.json`), badges synced items, and copies public Dropbox share links (`Ctrl+L`) via `dropbox-cli`.
-- **Zero Background Daemon** — Runs strictly on demand in user space with no elevated privileges (`No sudo or pkexec is required`).
+- **Dropbox Integration** — Automatically detects personal and business Dropbox roots (`~/.dropbox/info.json`), badges synced items, and copies public Dropbox share links (`Ctrl+L`) via `dropbox-cli` over `stdin` to `wl-copy` (note: any system clipboard history manager you have enabled will record copied share links like any other clipboard entry).
+- **Private Local Cache & Zero Background Daemon** — Runs strictly on demand in user space with no elevated privileges (`No sudo or pkexec is required`), storing its FTS5 index and rendered previews inside a `0700`/`0600` user-private directory (`~/.cache/io.github.thibaudberdin.spotlight-files/`).
 - **Live Theme & Localization** — Follows Omarchy theme switches and language changes live (`en` and `fr` bundled).
 
 ## Installation

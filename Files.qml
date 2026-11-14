@@ -187,33 +187,37 @@ Item {
     root.schedulePreview()
   }
 
+  function runHelperAction(kind, p) {
+    actionProc.enqueue(kind, p)
+  }
+
   function activateSelected(revealInFolder) {
     var p = root.selectedPath
     if (!p) return
     root.close()
-    var kind = revealInFolder ? "reveal" : "open"
-    Util.execArgv(["python3", root.helperScript, "action", kind, "--", p])
+    root.runHelperAction(revealInFolder ? "reveal" : "open", p)
   }
 
   function copySelectedPath() {
     var p = root.selectedPath
     if (!p) return
     root.close()
-    Util.execArgv(["python3", root.helperScript, "action", "copy-path", "--", p])
+    root.runHelperAction("copy-path", p)
   }
 
   function copyDropboxLink() {
     var p = root.selectedPath
     if (!p || !root.selectedInDropbox) return
     root.close()
-    Util.execArgv(["python3", root.helperScript, "action", "dropbox-link", "--", p])
+    root.runHelperAction("dropbox-link", p)
   }
 
   function trashSelected() {
     var p = root.selectedPath
-    if (!p) return
+    if (!p || trashProc.running) return
     trashProc.targetPath = p
-    trashProc.command = ["python3", root.helperScript, "action", "trash", "--", p]
+    trashProc.environment = ({ SPOTLIGHT_PATH: p })
+    trashProc.command = ["python3", "-I", root.helperScript, "action", "trash"]
     trashProc.running = true
   }
 
@@ -228,7 +232,7 @@ Item {
       root.dispatchQuery()
     } else {
       var wantContent = root.searchMode === "content" || /^\s*(\?|c:)/i.test(root.filterText)
-      queryTimer.interval = wantContent ? 130 : 60
+      queryTimer.interval = wantContent ? 180 : 60
       queryTimer.start()
     }
   }
@@ -258,11 +262,12 @@ Item {
     id: queryProc
     property int activeSerial: 0
     property string collected: ""
-    property bool streamDone: false
-    property bool finishedExited: false
+    property bool streamDone: true
+    property bool finishedExited: true
     property int lastExitCode: -1
 
     function startPending() {
+      if (running || !finishedExited || !streamDone) return
       if (!root.pendingQuerySpec) {
         root.searching = false
         return
@@ -274,23 +279,24 @@ Item {
       streamDone = false
       finishedExited = false
       lastExitCode = -1
+      environment = ({ SPOTLIGHT_QUERY: spec.query })
       command = [
         "python3",
+        "-I",
         root.helperScript,
         "query",
         "--mode=" + spec.mode,
-        "--limit=55",
-        "--text=" + spec.query
+        "--limit=55"
       ]
       running = true
     }
 
     function tryFinish() {
-      if (root.pendingQuerySpec && !running) {
+      if (!finishedExited || !streamDone) return
+      if (root.pendingQuerySpec) {
         startPending()
         return
       }
-      if (!finishedExited || !streamDone) return
       root.searching = false
       if (lastExitCode !== 0 || activeSerial !== root.querySerial) return
       root.applyQueryResponse(collected)
@@ -308,10 +314,6 @@ Item {
     onExited: function(exitCode) {
       finishedExited = true
       lastExitCode = exitCode
-      if (root.pendingQuerySpec) {
-        startPending()
-        return
-      }
       tryFinish()
     }
   }
@@ -414,11 +416,12 @@ Item {
     id: previewProc
     property int activeSerial: 0
     property string collected: ""
-    property bool streamDone: false
-    property bool finishedExited: false
+    property bool streamDone: true
+    property bool finishedExited: true
     property int lastExitCode: -1
 
     function startPending() {
+      if (running || !finishedExited || !streamDone) return
       if (!root.pendingPreviewSpec) {
         root.previewLoading = false
         return
@@ -430,23 +433,25 @@ Item {
       streamDone = false
       finishedExited = false
       lastExitCode = -1
+      environment = ({
+        SPOTLIGHT_PATH: spec.path,
+        SPOTLIGHT_QUERY: spec.query
+      })
       command = [
         "python3",
+        "-I",
         root.helperScript,
-        "preview",
-        "--query=" + spec.query,
-        "--",
-        spec.path
+        "preview"
       ]
       running = true
     }
 
     function tryFinish() {
-      if (root.pendingPreviewSpec && !running) {
+      if (!finishedExited || !streamDone) return
+      if (root.pendingPreviewSpec) {
         startPending()
         return
       }
-      if (!finishedExited || !streamDone) return
       root.previewLoading = false
       if (lastExitCode !== 0 || activeSerial !== root.previewSerial) return
       var data = null
@@ -472,10 +477,6 @@ Item {
     onExited: function(exitCode) {
       finishedExited = true
       lastExitCode = exitCode
-      if (root.pendingPreviewSpec) {
-        startPending()
-        return
-      }
       tryFinish()
     }
   }
@@ -485,10 +486,10 @@ Item {
   Process {
     id: refreshProc
     property string collected: ""
-    property bool streamDone: false
-    property bool finishedExited: false
+    property bool streamDone: true
+    property bool finishedExited: true
     property int lastExitCode: -1
-    command: ["python3", root.helperScript, "refresh-paths"]
+    command: ["python3", "-I", root.helperScript, "refresh-paths"]
 
     function startRefresh() {
       if (running) return
@@ -530,7 +531,7 @@ Item {
 
   Process {
     id: indexProc
-    command: ["python3", root.helperScript, "index"]
+    command: ["python3", "-I", root.helperScript, "index"]
     stdout: SplitParser {
       onRead: function(line) {
         try {
@@ -546,6 +547,27 @@ Item {
         root.scheduleQuery(true)
       }
     }
+  }
+
+  Process {
+    id: actionProc
+    property var queue: []
+    function enqueue(kind, targetPath) {
+      var next = queue.slice()
+      next.push({ kind: kind, path: targetPath })
+      queue = next
+      if (!running) runNext()
+    }
+    function runNext() {
+      if (running || queue.length === 0) return
+      var next = queue.slice()
+      var item = next.shift()
+      queue = next
+      environment = ({ SPOTLIGHT_PATH: item.path })
+      command = ["python3", "-I", root.helperScript, "action", item.kind]
+      running = true
+    }
+    onExited: runNext()
   }
 
   Process {

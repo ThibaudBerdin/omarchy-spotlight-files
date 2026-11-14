@@ -6,9 +6,13 @@ BarWidget {
   id: root
   moduleName: "io.github.thibaudberdin.spotlight-files"
 
-  readonly property string pluginDir: decodeURIComponent(
-    String(Qt.resolvedUrl(".")).replace(/^(file|qs):\/\//, "")
-  ).replace(/\/+$/, "")
+  property var manifest: null
+
+  readonly property string pluginDir: (manifest && manifest.__sourceDir)
+    ? String(manifest.__sourceDir).replace(/\/+$/, "")
+    : decodeURIComponent(
+        String(Qt.resolvedUrl(".")).replace(/^(file|qs):\/\//, "")
+      ).replace(/\/+$/, "")
 
   Commons.Translations {
     id: strings
