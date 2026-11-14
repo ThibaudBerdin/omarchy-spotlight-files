@@ -8,14 +8,15 @@ Includes both a **centered Spotlight overlay** and a **top-bar magnifying glass 
 
 ## Features
 
-- **Instant Filename Search (`Names` mode)** — Fuzzy path matching over `~` via `fd` + `fzf --scheme=path` (~25–200 ms across 200k+ files, symmetric Unicode/accent normalization).
+- **Instant Filename Search (`Names` mode)** — Fuzzy path matching over `~` (paths discovered by `fd`) with a built-in, in-process fzf-style `--scheme=path` ranker: filename-over-folder bonus, word-start bonuses after `/` `-` `_` `.` and spaces, contiguous-match bonus, multiple space-separated terms (all must match, in any order), and case/accent-insensitive matching on both sides (`resume` finds `Résumé.pdf`, `été` finds `ete-2024`). Typically ~25–60 ms across 200k+ files.
 - **Document Content Search (`Content` mode)** — Searches inside **PDF**, **Word (`.docx`)**, **Excel (`.xlsx`)**, **PowerPoint (`.pptx`)**, **OpenDocument (`.odt`, `.ods`, `.odp`)**, and plain-text/Markdown/code files using a local incremental **SQLite FTS5** cache (`unicode61 remove_diacritics 2`) combined with live `ripgrep`.
 - **Live Split Preview** — Renders PDF first-page previews (`pdftoppm`), images, extracted Office/PDF text snippets around your search terms, plain-text/code files, and folder contents.
 - **Top-Bar Icon (`bar-widget`)** — Native `BarIconButton` that adapts to your live Omarchy theme:
   - **Left-click**: toggle Spotlight overlay in filename mode.
   - **Right-click**: summon Spotlight overlay directly in document content mode.
 - **Dropbox Integration** — Automatically detects personal and business Dropbox roots (`~/.dropbox/info.json`), badges synced items, and copies public Dropbox share links (`Ctrl+L`) via `dropbox-cli` over `stdin` to `wl-copy` (note: any system clipboard history manager you have enabled will record copied share links like any other clipboard entry).
-- **Private Local Cache & Zero Background Daemon** — Runs strictly on demand in user space with no elevated privileges (`No sudo or pkexec is required`), storing its FTS5 index and rendered previews inside a `0700`/`0600` user-private directory (`~/.cache/io.github.thibaudberdin.spotlight-files/`).
+- **Private Local Cache & Zero Background Daemon** — Runs strictly on demand in user space with no elevated privileges (`No sudo or pkexec is required`), storing its path list (plus derived case/accent-folded search mirrors), FTS5 index and rendered previews inside a `0700`/`0600` user-private directory (`~/.cache/io.github.thibaudberdin.spotlight-files/`).
+- **No Search Terms or Document Paths in Process Arguments** — Filename queries are matched inside the Python helper itself, content queries reach `ripgrep` over `stdin`, and PDFs are passed to `pdftotext`/`pdftoppm` as `/dev/stdin`, so neither what you search for nor which document is being indexed or previewed shows up in the world-readable `/proc/<pid>/cmdline` of any helper process. (Explicit actions you trigger on a selected item — open, reveal, trash, Dropbox link — still hand that item's path to the corresponding desktop tool, and their confirmation notifications show the item's file name.)
 - **Live Theme & Localization** — Follows Omarchy theme switches and language changes live (`en` and `fr` bundled).
 
 ## Installation
@@ -67,9 +68,8 @@ All core dependencies are standard userland utilities preinstalled on Omarchy / 
 
 | Dependency | Binary | Purpose | Required |
 |---|---|---|---|
-| `python` | `python3` | Search, XML Office extraction, and SQLite FTS5 backend | Yes |
+| `python` | `python3` | Search, built-in fuzzy path ranking, XML Office extraction, and SQLite FTS5 backend | Yes |
 | `fd` | `fd` | Fast filesystem path and recent-file discovery | Yes |
-| `fzf` | `fzf` | Fuzzy path ranking (`--scheme=path`) | Yes |
 | `ripgrep` | `rg` | Live plain-text, Markdown, CSV, and code content search | Yes |
 | `poppler` | `pdftotext`, `pdftoppm` | PDF text extraction and page-1 visual preview | Recommended |
 | `glib2` | `gdbus`, `gio` | Reveal in file manager (`FileManager1`) and move to trash | Yes |

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.thibaudberdin.spotlight-files",
   "name": "Spotlight Files",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "Thibaud Berdin",
   "license": "MIT",
-  "description": "Spotlight-style file and document search for Omarchy: instant filename fuzzy search (fd + fzf) and on-demand PDF, Office & text content search (SQLite FTS5 + ripgrep) with live preview, Dropbox share-link copy, and zero background daemon.",
+  "description": "Spotlight-style file and document search for Omarchy: instant filename fuzzy search (fd + built-in path ranker) and on-demand PDF, Office & text content search (SQLite FTS5 + ripgrep) with live preview, Dropbox share-link copy, and zero background daemon.",
   "kinds": [
     "overlay",
     "bar-widget"

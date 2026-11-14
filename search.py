@@ -2,10 +2,13 @@
 """Spotlight-style search & preview backend for Spotlight Files (Omarchy Quickshell).
 
 Zero permanent background daemon:
-- Filename search: fd + fzf --scheme=path over cached relative paths (~25-200ms on 220k files).
+- Filename search: fd-cached relative paths ranked by an in-process fzf-style (--scheme=path) fuzzy
+  matcher over private case/accent-folded mirrors (~25-60ms on 220k files); the query never reaches
+  any child process argv.
 - Content search: SQLite FTS5 local cache (unicode61 remove_diacritics 2) for PDFs & Office
   documents + live ripgrep (rg --fixed-strings -f -) for text/markdown/code.
 - Preview: PDF page rendering (pdftoppm -scale-to), images, streaming Office XML text, text/code, folder listing.
+  PDFs are handed to pdftotext/pdftoppm as /dev/stdin so document paths stay out of argv as well.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import hashlib
+import heapq
 import io
 import json
 import os
@@ -360,12 +364,17 @@ def refresh_paths_cache() -> int:
 
     lines = [ln.rstrip("/") for ln in raw_stdout.splitlines() if ln and not ln.startswith(".") and "\ufffd" not in ln]
 
-    fd_tmp, tmp_name = tempfile.mkstemp(prefix="paths.", dir=str(CACHE_DIR), text=True)
+    text = "\n".join(lines) + ("\n" if lines else "")
+    fd_tmp, tmp_name = tempfile.mkstemp(prefix="paths.", dir=str(CACHE_DIR))
     try:
-        with os.fdopen(fd_tmp, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines))
-            if lines:
-                fh.write("\n")
+        with os.fdopen(fd_tmp, "wb") as fh:
+            fh.write(text.encode("utf-8", errors="replace"))
+        # Derived folded caches are bound to this exact file (inode/size/mtime) and published
+        # before paths.txt itself, so readers never pair a new paths.txt with stale offsets.
+        try:
+            write_fold_caches(text, os.stat(tmp_name))
+        except Exception:
+            pass
         os.replace(tmp_name, PATHS_CACHE)
     finally:
         if os.path.exists(tmp_name):
@@ -763,15 +772,44 @@ def extract_odf(path: Path, max_bytes: int) -> str:
         return "".join(chunks)[:max_bytes]
 
 
+def open_pdf_for_child_stdin(path: Path) -> io.BufferedReader | None:
+    """Open a regular file read-only so a poppler child can read it as /dev/stdin.
+
+    Handing the document over as an inherited stdin descriptor (and naming it "/dev/stdin") keeps the
+    confidential document path out of the child's world-readable /proc/<pid>/cmdline. "/dev/stdin" is
+    preferred over "-" because poppler then re-opens the same regular file (seekable, lazily paged)
+    instead of copying the whole PDF from a pipe into memory. O_NONBLOCK guards against FIFOs.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+        os.set_blocking(fd, True)
+        return os.fdopen(fd, "rb")
+    except OSError:
+        os.close(fd)
+        return None
+
+
 def extract_pdf(path: Path, max_bytes: int, timeout_sec: float = 3.5) -> str:
     """Stream at most max_bytes from pdftotext and terminate early so giant PDFs never buffer in RAM."""
     proc: subprocess.Popen[bytes] | None = None
+    src = open_pdf_for_child_stdin(path)
+    if src is None:
+        return ""
     try:
-        proc = subprocess.Popen(
-            ["pdftotext", "-q", "-nopgbrk", "-l", "120", "--", str(path), "-"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
+        with src:
+            proc = subprocess.Popen(
+                ["pdftotext", "-q", "-nopgbrk", "-l", "120", "/dev/stdin", "-"],
+                stdin=src,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
         deadline = time.monotonic() + timeout_sec
         chunks: list[bytes] = []
         total = 0
@@ -795,6 +833,8 @@ def extract_pdf(path: Path, max_bytes: int, timeout_sec: float = 3.5) -> str:
                 proc.wait(timeout=1.0)
             except Exception:
                 pass
+            if proc.stdout is not None:
+                proc.stdout.close()
 
 
 def extract_document_text(path: Path, max_bytes: int = 350_000) -> str:
@@ -917,6 +957,586 @@ def opportunistic_index_recent(con: sqlite3.Connection, cfg: dict, window: str =
         _upsert_fts_batch(con, rows_to_save)
 
 
+# ---------------- In-process fuzzy path matcher (replaces `fzf --filter`) ----------------
+#
+# The Names-mode query must never appear in any child's argv (/proc/<pid>/cmdline is world-readable),
+# so path matching runs entirely inside this process. To stay fast on 200k+ paths, refresh-paths also
+# writes two private derived caches next to paths.txt:
+#   paths.fold — paths.txt lowercased and accent-stripped *character for character* (same length, so
+#                every offset in paths.fold is the same offset in paths.txt). Characters that have no
+#                ASCII folding (’, °, œ, CJK…) become the placeholder \x7f, keeping the text pure ASCII
+#                (compact 1-byte str, fastest `re`/`str.find` paths);
+#   names.fold — a header binding it to the exact paths.txt (inode/size/mtime/length) it was derived
+#                from, then one "<folded basename>\0<line offset>" record per path; offsets are written
+#                in hexadecimal with the letters A–P, which can never occur in a (lowercase) folded term.
+# Candidates are located with C-speed literal searches (str.find) and possessive, backtracking-free
+# regexes over those folded texts; only a bounded candidate set is then re-folded exactly and scored in
+# Python with fzf-like `--scheme=path` rules (boundary/camelCase/consecutive bonuses, gap penalties),
+# plus a filename-over-directory bonus.
+
+PATHS_FOLD_CACHE = CACHE_DIR / "paths.fold"
+NAMES_FOLD_CACHE = CACHE_DIR / "names.fold"
+_FOLD_MAGIC = "#spotlight-files-fold-v2"
+
+MAX_NAME_CANDIDATES = 2000
+MAX_TIER_GATHER = 8_000
+MAX_QUERY_TERMS = 8
+
+# Single-character foldings Unicode decomposition does not provide (must keep a 1:1 length).
+_FOLD_EXTRA = {"ø": "o", "ł": "l", "đ": "d", "ð": "d", "ħ": "h", "ı": "i", "ŧ": "t", "ŀ": "l"}
+_NON_ASCII_RUN = re.compile(r"[^\x00-\x7f]+")
+_NON_ASCII_CHAR = re.compile(r"[^\x00-\x7f]")
+_LOSSY_PLACEHOLDER = "\x7f"
+_HEX_TO_LETTERS = str.maketrans("0123456789abcdef", "ABCDEFGHIJKLMNOP")
+_LETTERS_TO_HEX = str.maketrans("ABCDEFGHIJKLMNOP", "0123456789abcdef")
+_fold_char_cache: dict[str, str] = {}
+_fold_run_cache: dict[str, str] = {}
+
+
+def _fold_char(c: str) -> str:
+    r = _fold_char_cache.get(c)
+    if r is None:
+        low = c.lower()
+        if len(low) != 1:
+            low = c
+        base = strip_accents(low)
+        if len(base) == 1:
+            base_low = base.lower()
+            r = base_low if len(base_low) == 1 else base
+        else:
+            r = low  # e.g. a lone combining mark: keep it so lengths stay aligned
+        r = _FOLD_EXTRA.get(r, r)
+        _fold_char_cache[c] = r
+    return r
+
+
+def _fold_run(m: re.Match[str]) -> str:
+    run = m.group()
+    r = _fold_run_cache.get(run)
+    if r is None:
+        r = "".join(map(_fold_char, run))
+        if len(_fold_run_cache) < 100_000:
+            _fold_run_cache[run] = r
+    return r
+
+
+def fold_text(text: str) -> str:
+    """Case- and accent-insensitive form of text with exactly the same length (offset compatible)."""
+    if text.isascii():
+        return text.lower()
+    folded = _NON_ASCII_RUN.sub(_fold_run, text).lower()
+    if len(folded) == len(text):
+        return folded
+    return "".join(c.lower() if c.isascii() else _fold_char(c) for c in text)
+
+
+def lossy_ascii(folded: str) -> str:
+    """Same-length pure-ASCII search form: any leftover non-ASCII char becomes the \\x7f placeholder.
+
+    Applied identically to the cache and to query terms, so it can only add candidates (never lose
+    one); each candidate is re-checked against its exact fold before scoring.
+    """
+    return folded if folded.isascii() else _NON_ASCII_CHAR.sub(_LOSSY_PLACEHOLDER, folded)
+
+
+def query_terms(query: str) -> list[str]:
+    """Space-separated, folded, de-duplicated search terms (accents in the query are ignored too)."""
+    q = unicodedata.normalize("NFC", re.sub(r"[\x00-\x1f\x7f]", " ", query))
+    folded = "".join(c for c in fold_text(q) if unicodedata.category(c) != "Mn")
+    terms: list[str] = []
+    for t in folded.split():
+        if t not in terms:
+            terms.append(t)
+    return terms[:MAX_QUERY_TERMS]
+
+
+def _read_private_text(path: Path) -> str:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read().decode("utf-8", errors="replace")
+
+
+def _atomic_write_private(target: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(text.encode("utf-8", errors="replace"))
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _fold_header(st: os.stat_result, text_len: int) -> str:
+    return f"{_FOLD_MAGIC} {st.st_ino}:{st.st_size}:{st.st_mtime_ns}:{text_len}"
+
+
+def build_names_index(fold: str, header: str) -> str:
+    parts = [header]
+    off = 0
+    for line in fold.split("\n"):
+        if line:
+            parts.append(f"{line[line.rfind('/') + 1:]}\x00{format(off, 'x').translate(_HEX_TO_LETTERS)}")
+        off += len(line) + 1
+    return "\n".join(parts) + "\n"
+
+
+def _decode_offset(enc: str) -> int:
+    return int(enc.translate(_LETTERS_TO_HEX), 16)
+
+
+def write_fold_caches(text: str, st: os.stat_result) -> tuple[str, str]:
+    """Derive and persist paths.fold / names.fold for the paths.txt content described by st."""
+    fold = lossy_ascii(fold_text(text))
+    names = build_names_index(fold, _fold_header(st, len(text)))
+    try:
+        _atomic_write_private(PATHS_FOLD_CACHE, fold)
+        _atomic_write_private(NAMES_FOLD_CACHE, names)
+    except Exception:
+        pass
+    return fold, names
+
+
+class NameCaches:
+    __slots__ = ("orig", "fold", "names")
+
+    def __init__(self, orig: str, fold: str, names: str) -> None:
+        self.orig = orig
+        self.fold = fold
+        self.names = names
+
+
+def load_name_caches() -> NameCaches | None:
+    if not PATHS_CACHE.is_file():
+        refresh_paths_cache()
+    try:
+        fd = os.open(PATHS_CACHE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            orig = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    fold: str | None = None
+    names: str | None = None
+    try:
+        names = _read_private_text(NAMES_FOLD_CACHE)
+        if names[: names.find("\n")] == _fold_header(st, len(orig)):
+            fold = _read_private_text(PATHS_FOLD_CACHE)
+            if len(fold) != len(orig):
+                fold = None
+    except OSError:
+        fold = None
+    if fold is None or names is None:
+        try:
+            ensure_dirs()
+        except Exception:
+            pass
+        fold, names = write_fold_caches(orig, st)
+    return NameCaches(orig, fold, names)
+
+
+def _fuzzy_regex(term: str, stop: str) -> str:
+    """Possessive left-to-right subsequence pattern: linear time, never backtracks."""
+    return "".join(f"[^{re.escape(ch)}{stop}]*+{re.escape(ch)}" for ch in term)
+
+
+def _names_body_start(names: str) -> int:
+    """Offset just past the header line (records start there; each record is preceded by '\\n')."""
+    return names.find("\n") + 1
+
+
+# Tier iterators yield (line offset in paths.txt/paths.fold, basename length) in file order.
+
+
+def _iter_name_prefix_hits(names: str, needle: str):
+    """Paths whose folded basename starts with needle (literal C search)."""
+    pat = "\n" + needle
+    find = names.find
+    pos = _names_body_start(names) - 1
+    while True:
+        i = find(pat, pos)
+        if i < 0:
+            return
+        z = find("\x00", i + 1)
+        if z < 0:
+            return
+        e = find("\n", z)
+        if e < 0:
+            e = len(names)
+        if i + len(pat) <= z:
+            yield _decode_offset(names[z + 1 : e]), z - i - 1
+        pos = e
+
+
+def _iter_name_substring_hits(names: str, needle: str):
+    """Paths whose folded basename contains needle (literal C search)."""
+    find = names.find
+    n = len(needle)
+    pos = _names_body_start(names)
+    while True:
+        i = find(needle, pos)
+        if i < 0:
+            return
+        ls = names.rfind("\n", 0, i) + 1
+        e = find("\n", i)
+        if e < 0:
+            e = len(names)
+        z = find("\x00", ls, e)
+        if z >= 0 and i + n <= z:
+            yield _decode_offset(names[z + 1 : e]), z - ls
+        pos = e + 1
+
+
+def _iter_path_substring_hits(fold: str, needle: str):
+    """Paths whose folded full relative path contains needle (literal C search)."""
+    find = fold.find
+    rfind = fold.rfind
+    pos = 0
+    while True:
+        i = find(needle, pos)
+        if i < 0:
+            return
+        ls = rfind("\n", 0, i) + 1
+        e = find("\n", i)
+        if e < 0:
+            e = len(fold)
+        yield ls, e - max(ls, rfind("/", ls, e) + 1)
+        pos = e + 1
+
+
+def _literal_first_fuzzy(term: str, stop: str) -> re.Pattern[str]:
+    # Leading literal lets `re` jump between occurrences of term[0] in C; the rest never backtracks.
+    return re.compile(re.escape(term[0]) + _fuzzy_regex(term[1:], stop))
+
+
+def _iter_name_fuzzy_hits(names: str, term: str):
+    """Paths whose folded basename contains term as a subsequence."""
+    search = _literal_first_fuzzy(term, r"\n\x00").search
+    find = names.find
+    pos = _names_body_start(names)
+    while True:
+        m = search(names, pos)
+        if m is None:
+            return
+        z = find("\x00", m.end())
+        if z < 0:
+            return
+        e = find("\n", z)
+        if e < 0:
+            e = len(names)
+        yield _decode_offset(names[z + 1 : e]), z - names.rfind("\n", 0, m.start()) - 1
+        pos = e
+
+
+def _iter_path_fuzzy_hits(fold: str, term: str):
+    """Paths whose folded full relative path contains term as a subsequence."""
+    search = _literal_first_fuzzy(term, r"\n").search
+    find = fold.find
+    rfind = fold.rfind
+    pos = 0
+    while True:
+        m = search(fold, pos)
+        if m is None:
+            return
+        ls = rfind("\n", 0, m.start()) + 1
+        e = find("\n", m.end())
+        if e < 0:
+            e = len(fold)
+        yield ls, e - max(ls, rfind("/", ls, e) + 1)
+        if e >= len(fold):
+            return
+        pos = e
+
+
+# fzf-compatible scoring constants (algo.go), `--scheme=path` flavour.
+_SCORE_MATCH = 16
+_SCORE_GAP_START = -3
+_SCORE_GAP_EXT = -1
+_BONUS_BOUNDARY = _SCORE_MATCH // 2
+_BONUS_NONWORD = _SCORE_MATCH // 2
+_BONUS_CAMEL123 = _BONUS_BOUNDARY + _SCORE_GAP_EXT
+_BONUS_CONSECUTIVE = -(_SCORE_GAP_START + _SCORE_GAP_EXT)
+_BONUS_FIRST_CHAR_MULT = 2
+_BONUS_BOUNDARY_WHITE = _BONUS_BOUNDARY
+_BONUS_BOUNDARY_DELIM = _BONUS_BOUNDARY + 1
+# Extra relevance on top of fzf: matches inside the filename, and exact filename/stem hits.
+_BONUS_BASENAME = 12
+_BONUS_EXACT_NAME = 24
+
+_C_WHITE, _C_NONWORD, _C_DELIM, _C_LOWER, _C_UPPER, _C_LETTER, _C_NUMBER = range(7)
+_char_class_cache: dict[str, int] = {}
+
+
+def _char_class(c: str) -> int:
+    cls = _char_class_cache.get(c)
+    if cls is None:
+        if c == "/":
+            cls = _C_DELIM
+        elif c.isspace():
+            cls = _C_WHITE
+        elif c.isdigit():
+            cls = _C_NUMBER
+        elif c.isalpha():
+            cls = _C_UPPER if c.isupper() else (_C_LOWER if c.islower() else _C_LETTER)
+        else:
+            cls = _C_NONWORD
+        _char_class_cache[c] = cls
+    return cls
+
+
+def _compute_bonus(prev: int, cur: int) -> int:
+    if cur > _C_NONWORD:
+        if prev == _C_WHITE:
+            return _BONUS_BOUNDARY_WHITE
+        if prev == _C_DELIM:
+            return _BONUS_BOUNDARY_DELIM
+        if prev == _C_NONWORD:
+            return _BONUS_BOUNDARY
+    if (prev == _C_LOWER and cur == _C_UPPER) or (prev != _C_NUMBER and cur == _C_NUMBER):
+        return _BONUS_CAMEL123
+    if cur in (_C_NONWORD, _C_DELIM):
+        return _BONUS_NONWORD
+    if cur == _C_WHITE:
+        return _BONUS_BOUNDARY_WHITE
+    return 0
+
+
+_BONUS_TABLE = [[_compute_bonus(p, c) for c in range(7)] for p in range(7)]
+
+
+def _calc_score(orig_line: str, fold_line: str, term: str, sidx: int, eidx: int) -> int:
+    """fzf v1 calculateScore over [sidx, eidx), visiting only the matched positions.
+
+    Equivalent to fzf's per-character loop: a gap of g characters costs GAP_START + (g-1)*GAP_EXT and
+    resets the consecutive/first-bonus state; character classes come from the original (cased) line.
+    """
+    find = fold_line.find
+    get_cls = _char_class_cache.get
+    table = _BONUS_TABLE
+    score = consecutive = first_bonus = 0
+    last = sidx - 1
+    pos = sidx
+    for pidx, ch in enumerate(term):
+        idx = find(ch, pos, eidx)
+        if idx < 0:
+            break
+        gap = idx - last - 1
+        if gap > 0:
+            score += _SCORE_GAP_START + (gap - 1) * _SCORE_GAP_EXT
+            consecutive = 0
+            first_bonus = 0
+        if idx > 0:
+            pc = orig_line[idx - 1]
+            prev = get_cls(pc)
+            if prev is None:
+                prev = _char_class(pc)
+        else:
+            prev = _C_DELIM
+        c = orig_line[idx]
+        cls = get_cls(c)
+        if cls is None:
+            cls = _char_class(c)
+        bonus = table[prev][cls]
+        if consecutive == 0:
+            first_bonus = bonus
+        else:
+            if bonus >= _BONUS_BOUNDARY and bonus > first_bonus:
+                first_bonus = bonus
+            if first_bonus > bonus:
+                bonus = first_bonus
+            if bonus < _BONUS_CONSECUTIVE:
+                bonus = _BONUS_CONSECUTIVE
+        score += _SCORE_MATCH + (bonus * _BONUS_FIRST_CHAR_MULT if pidx == 0 else bonus)
+        consecutive += 1
+        last = idx
+        pos = idx + 1
+    return score
+
+
+def _fuzzy_window(fold_line: str, term: str, start: int) -> tuple[int, int] | None:
+    """Greedy forward subsequence match, then backward shrink to the shortest window (fzf v1)."""
+    idx = start
+    find = fold_line.find
+    for ch in term:
+        idx = find(ch, idx)
+        if idx < 0:
+            return None
+        idx += 1
+    eidx = idx
+    j = eidx
+    rfind = fold_line.rfind
+    for ch in reversed(term):
+        j = rfind(ch, start, j)
+    return j, eidx
+
+
+_WORD_DELIMS = "/ -_."
+
+
+def _term_score(orig_line: str, fold_line: str, term: str, bstart: int) -> int | None:
+    n = len(term)
+    find = fold_line.find
+    first = find(term)
+    if first >= 0:
+        # Contiguous: score the first, the last (usually in the filename) and boundary occurrences.
+        starts = {first, fold_line.rfind(term)}
+        i = find(term, first + 1)
+        probes = 0
+        while i >= 0 and probes < 8:
+            if fold_line[i - 1] in _WORD_DELIMS:
+                starts.add(i)
+            probes += 1
+            i = find(term, i + 1)
+        return max(
+            _calc_score(orig_line, fold_line, term, s, s + n) + (_BONUS_BASENAME if s >= bstart else 0)
+            for s in starts
+        )
+    windows = []
+    w = _fuzzy_window(fold_line, term, 0)
+    if w is None:
+        return None
+    windows.append(w)
+    if bstart > w[0]:
+        wb = _fuzzy_window(fold_line, term, bstart)
+        if wb is not None:
+            windows.append(wb)
+    return max(
+        _calc_score(orig_line, fold_line, term, s, e) + (_BONUS_BASENAME if s >= bstart else 0)
+        for s, e in windows
+    )
+
+
+def _line_score(orig_line: str, fold_line: str, terms: list[str]) -> int | None:
+    bstart = fold_line.rfind("/") + 1
+    name = fold_line[bstart:]
+    dot = name.rfind(".")
+    stem = name[:dot] if dot > 0 else name
+    total = 0
+    for term in terms:
+        sc = _term_score(orig_line, fold_line, term, bstart)
+        if sc is None:
+            return None
+        if term == name or term == stem:
+            sc += _BONUS_EXACT_NAME
+        total += sc
+    return total
+
+
+def _estimate_count(text: str, needle: str, samples: int = 16, span: int = 131_072) -> int:
+    """Occurrence estimate from evenly spread slices (~2 MB scanned instead of the whole cache)."""
+    n = len(text)
+    if n <= samples * span:
+        return text.count(needle)
+    step = n // samples
+    return sum(text.count(needle, i * step, i * step + span) for i in range(samples))
+
+
+def _verify_spans(fold: str, spans: list[tuple[int, int, int]], rx: re.Pattern[str]) -> list[tuple[int, int, int]]:
+    """Keep spans whose folded line satisfies rx: one backtracking-free `re` pass over a joined blob."""
+    line_at: dict[int, int] = {}
+    off = 0
+    for idx, (_, ls, le) in enumerate(spans):
+        line_at[off] = idx
+        off += le - ls + 1
+    blob = "\n".join([fold[ls:le] for _, ls, le in spans])
+    return [spans[line_at[m.start()]] for m in rx.finditer(blob)]
+
+
+def rank_paths(caches: NameCaches, terms: list[str], want: int, accept=None) -> list[str]:
+    """Return relative paths ranked best-first; every term must fuzzy-match (AND, order-independent).
+
+    Candidates are gathered tier by tier, best tiers first: filename starts with a term, filename
+    contains a term, full path contains the most selective term, then (only if still scarce) fuzzy
+    filename / fuzzy path matches. Each tier is verified against the remaining terms in bulk; when a
+    tier overflows the candidate budget, the shortest filenames are kept.
+    """
+    orig, fold, names = caches.orig, caches.fold, caches.names
+    search_terms = list(dict.fromkeys(lossy_ascii(t) for t in terms))
+    if len(search_terms) > 1:
+        search_terms.sort(key=lambda t: (_estimate_count(fold, t), -len(t)))
+    primary = search_terms[0]
+
+    verifiers: dict[str, re.Pattern[str] | None] = {}
+
+    def verifier(gen_term: str) -> re.Pattern[str] | None:
+        if gen_term not in verifiers:
+            rest = [t for t in search_terms if t != gen_term]
+            verifiers[gen_term] = (
+                re.compile("^" + "".join("(?=" + _fuzzy_regex(t, r"\n") + ")" for t in rest), re.M)
+                if rest
+                else None
+            )
+        return verifiers[gen_term]
+
+    seen: set[int] = set()
+    cands: list[tuple[int, int]] = []
+
+    def gather(hits, gen_term: str, share: int = MAX_NAME_CANDIDATES) -> bool:
+        """Add one tier's verified hits (at most `share`); returns True once the budget is full."""
+        room = min(share, MAX_NAME_CANDIDATES - len(cands))
+        if room <= 0:
+            return len(cands) >= MAX_NAME_CANDIDATES
+        limit = min(MAX_TIER_GATHER, max(4 * room, 1000))
+        spans: list[tuple[int, int, int]] = []
+        find = fold.find
+        for ls, blen in hits:
+            if ls in seen:
+                continue
+            seen.add(ls)
+            le = find("\n", ls)
+            if le < 0:
+                le = len(fold)
+            if le > ls:
+                spans.append((blen, ls, le))
+            if len(spans) >= limit:
+                break
+        if not spans:
+            return False
+        rx = verifier(gen_term)
+        if rx is not None:
+            spans = _verify_spans(fold, spans, rx)
+        if accept is not None:
+            spans = [sp for sp in spans if accept(orig[sp[1] : sp[2]])]
+        if len(spans) > room:
+            spans = heapq.nsmallest(room, spans)
+        cands.extend((ls, le) for _, ls, le in spans)
+        return len(cands) >= MAX_NAME_CANDIDATES
+
+    name_terms = [t for t in search_terms if "/" not in t]
+    # With several terms, each one's filename tiers get a fair share of the budget so that a path whose
+    # filename holds a less selective term (e.g. "Factures/dropbox.pdf") still competes.
+    share = MAX_NAME_CANDIDATES // len(name_terms) if len(name_terms) > 1 else MAX_NAME_CANDIDATES
+    tiers = [(_iter_name_prefix_hits, names, t, share) for t in name_terms]
+    tiers += [(_iter_name_substring_hits, names, t, share) for t in name_terms]
+    tiers.append((_iter_path_substring_hits, fold, primary, MAX_NAME_CANDIDATES))
+    full = False
+    for make, text, t, tier_share in tiers:
+        if gather(make(text, t), t, tier_share):
+            full = True
+            break
+    # Fuzzy tiers only when contiguous matches are scarce (they would rank below them anyway).
+    if not full and "/" not in primary and len(cands) < max(want * 2, 100):
+        full = gather(_iter_name_fuzzy_hits(names, primary), primary)
+    if not full and len(cands) < want:
+        gather(_iter_path_fuzzy_hits(fold, primary), primary)
+
+    scored: list[tuple[int, int, int, str]] = []
+    for ls, le in cands:
+        ol = orig[ls:le]
+        # Exact (non-lossy) fold of this one line: rejects \x7f placeholder false positives.
+        fl = fold_text(ol)
+        sc = _line_score(ol, fl, terms)
+        if sc is None:
+            continue
+        scored.append((-sc, le - ls - fl.rfind("/") - 1, le - ls, ol))
+    scored.sort()
+    return [row[3] for row in scored]
+
+
 # ---------------- Search implementations ----------------
 
 
@@ -972,30 +1592,28 @@ def matches_filter_kind(path: Path, is_dir: bool, filter_kind: str) -> bool:
     return True
 
 
-def search_names(query: str, filter_kind: str, limit: int) -> list[dict]:
-    if not PATHS_CACHE.is_file():
-        refresh_paths_cache()
+def _kind_from_suffix_ok(rel: str, filter_kind: str) -> bool:
+    """Cheap pre-scoring extension filter (no stat); 'dir' is resolved later with a real stat."""
+    if filter_kind in ("all", "dir"):
+        return True
+    return matches_filter_kind(Path(rel), False, filter_kind)
 
-    norm_q = strip_accents(query)
-    cmd = ["fzf", f"--filter={norm_q}", "--scheme=path"]
-    try:
-        with open(PATHS_CACHE, "rb") as fh:
-            proc = subprocess.run(
-                cmd,
-                stdin=fh,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=3.0,
-                check=False,
-            )
-    except Exception:
+
+def search_names(query: str, filter_kind: str, limit: int) -> list[dict]:
+    """In-process fuzzy path search: the query never leaves this process (no fzf argv)."""
+    terms = query_terms(query)
+    if not terms:
+        return []
+    caches = load_name_caches()
+    if caches is None:
         return []
 
+    want = max(limit * 3, 120) if filter_kind == "dir" else limit
+    ranked = rank_paths(caches, terms, want=want, accept=lambda rel: _kind_from_suffix_ok(rel, filter_kind))
+
     results: list[dict] = []
-    for raw_line in proc.stdout.decode("utf-8", errors="replace").splitlines():
-        if not raw_line:
-            continue
-        p = HOME / raw_line
+    for rel in ranked:
+        p = HOME / rel
         is_dir = p.is_dir()
         if not matches_filter_kind(p, is_dir, filter_kind):
             continue
@@ -1211,14 +1829,20 @@ def render_pdf_page1(path: Path, mtime_ns: int) -> str:
         return str(out_png)
     tmp_prefix = PREVIEW_DIR / f".tmp.{key}.{os.getpid()}"
     tmp_png = PREVIEW_DIR / f".tmp.{key}.{os.getpid()}.png"
+    src = open_pdf_for_child_stdin(path)
+    if src is None:
+        return ""
     try:
-        subprocess.run(
-            ["pdftoppm", "-png", "-scale-to", "1000", "-f", "1", "-l", "1", "-singlefile", "--", str(path), str(tmp_prefix)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=3.0,
-            check=False,
-        )
+        # The PDF arrives as /dev/stdin; argv only carries the opaque hashed output prefix.
+        with src:
+            subprocess.run(
+                ["pdftoppm", "-png", "-scale-to", "1000", "-f", "1", "-l", "1", "-singlefile", "/dev/stdin", str(tmp_prefix)],
+                stdin=src,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3.0,
+                check=False,
+            )
         if tmp_png.is_file() and not tmp_png.is_symlink():
             os.replace(tmp_png, out_png)
             return str(out_png)
